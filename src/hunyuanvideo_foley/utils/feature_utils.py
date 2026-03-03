@@ -76,12 +76,14 @@ def encode_video_with_siglip2(x: torch.Tensor, model_dict, batch_size: int = -1)
     return res
 
 @torch.inference_mode()
-def encode_video_with_sync(x: torch.Tensor, model_dict, batch_size: int = -1):
+def encode_video_with_sync(x: torch.Tensor, model_dict, batch_size: int = 4):
     """
     The input video of x is best to be in fps of 24 of greater than 24.
     Input:
         x: tensor in shape of [B, T, C, H, W]
-        batch_size: the batch_size for synchformer inference
+        batch_size: segments to process per Synchformer call.
+                    Default 4 keeps attention memory manageable for long videos.
+                    Use -1 to process all segments at once (may OOM on long videos).
     """
     b, t, c, h, w = x.shape
     assert c == 3 and h == 224 and w == 224
@@ -95,11 +97,12 @@ def encode_video_with_sync(x: torch.Tensor, model_dict, batch_size: int = -1):
     _device = str(model_dict.device) if hasattr(model_dict, 'device') else "cuda"
     _device_type = _device.split(":")[0]  # e.g. "cuda" or "cpu"
     x = torch.stack(segments, dim=1).to(_device)  # (B, num_segments, segment_size, 3, 224, 224)
+    del segments  # Free reference list; the stacked tensor is all we need
 
-    outputs = []
     if batch_size < 0:
         batch_size = b * num_segments
     x = rearrange(x, "b s t c h w -> (b s) 1 t c h w")
+    outputs = []
     for i in range(0, b * num_segments, batch_size):
         _autocast_enabled = _device_type == "cuda"
         with torch.autocast(device_type=_device_type, enabled=_autocast_enabled, dtype=torch.half):

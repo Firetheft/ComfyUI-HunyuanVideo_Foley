@@ -664,7 +664,18 @@ class HunyuanFoleySampler(io.ComfyNode):
                 io.String.Input("negative_prompt", default="noisy, harsh", multiline=True),
                 io.Float.Input("guidance_scale", default=4.5, min=1.0, max=10.0, step=0.1),
                 io.Int.Input("steps", default=50, min=10, max=100, step=1),
-                io.Int.Input("seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF)
+                io.Int.Input("seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF),
+                io.Int.Input(
+                    "sync_batch_size", default=4, min=-1, max=64, step=1, optional=True,
+                    tooltip=(
+                        "Synchformer 每次处理的视频 segment 数量（仅 cpu_offload 模式下生效）。\n"
+                        "每段 = 16帧，显存占用约 O(batch²)，推荐：\n"
+                        "  4  → 适合 8 GB 显存，35秒以上视频\n"
+                        "  8  → 适合 12 GB 显存，速度更快\n"
+                        "  16 → 适合 24 GB 显存，最快\n"
+                        "  -1 → 不分批（全部一次，适合短视频/大显存）"
+                    )
+                )
             ],
             outputs=[
                 io.Latent.Output()
@@ -672,7 +683,8 @@ class HunyuanFoleySampler(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, foley_model, video_frames, fps, prompt, negative_prompt, guidance_scale, steps, seed) -> io.NodeOutput:
+    def execute(cls, foley_model, video_frames, fps, prompt, negative_prompt,
+                guidance_scale, steps, seed, sync_batch_size=4) -> io.NodeOutput:
         # Support both old 3-tuple and new 4-tuple (with cpu_offload flag)
         if len(foley_model) == 4:
             model_dict, cfg, precision, cpu_offload = foley_model
@@ -735,12 +747,35 @@ class HunyuanFoleySampler(io.ComfyNode):
         images_siglip_pil = [Image.fromarray(f).convert('RGB') for f in frames_siglip_np]
 
         if cpu_offload:
+            # Flush any stale VRAM from previous ComfyUI nodes or incomplete
+            # runs before we start moving models to GPU.  This is the primary
+            # guard against intermittent OOMs on long videos.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+                gc.collect()
+                torch.cuda.empty_cache()
+
             logging.info("CPU offload: moving SigLIP2 to GPU for feature extraction...")
             with model_on_device(model_dict['siglip2_model'], device):
-                images_siglip = model_dict['siglip2_preprocess'](images=images_siglip_pil, return_tensors="pt").to(device)
+                images_siglip = model_dict['siglip2_preprocess'](
+                    images=images_siglip_pil, return_tensors="pt"
+                ).to(device)
+                # Process in small batches to cap activation VRAM for long videos
+                _siglip_batch = 16
+                _pooler_chunks = []
                 with torch.no_grad():
-                    siglip_output = model_dict['siglip2_model'](**images_siglip)
-                siglip_feat = siglip_output.pooler_output.unsqueeze(0).cpu()
+                    for _i in range(0, images_siglip['pixel_values'].shape[0], _siglip_batch):
+                        _batch_pv = images_siglip['pixel_values'][_i:_i + _siglip_batch]
+                        _out = model_dict['siglip2_model'](pixel_values=_batch_pv)
+                        _pooler_chunks.append(_out.pooler_output.cpu())
+                        del _out
+                # Free GPU tensors BEFORE context exits (model moves back to CPU)
+                del images_siglip, _batch_pv
+            siglip_feat = torch.cat(_pooler_chunks, dim=0).unsqueeze(0)
+            del _pooler_chunks
+            # Release SigLIP2 VRAM before Synchformer
+            gc.collect()
+            torch.cuda.empty_cache()
         else:
             images_siglip = model_dict['siglip2_preprocess'](images=images_siglip_pil, return_tensors="pt").to(device)
             with torch.no_grad():
@@ -757,14 +792,27 @@ class HunyuanFoleySampler(io.ComfyNode):
         if cpu_offload:
             logging.info("CPU offload: moving Synchformer to GPU for feature extraction...")
             with model_on_device(model_dict['syncformer_model'], device):
-                sync_frames_dev = sync_frames.to(device)
                 model_dict_with_device = {**model_dict, 'device': device,
                                            'syncformer_model': model_dict['syncformer_model']}
-                sync_feat = encode_video_with_sync(sync_frames_dev, AttributeDict(model_dict_with_device)).cpu()
+                # Pass sync_frames as CPU tensor — encode_video_with_sync calls
+                # .to(device) internally on only the stacked segments, avoiding
+                # a duplicate full-video GPU copy (~1.35 GB for 35s video).
+                # batch_size=4 limits Synchformer attention to 4 segments at a
+                # time, preventing the O(n²) attention matrix from OOMing.
+                sync_feat = encode_video_with_sync(
+                    sync_frames, AttributeDict(model_dict_with_device), batch_size=sync_batch_size
+                ).cpu()
+                del model_dict_with_device
+            del sync_frames
+            # Release Synchformer VRAM before CLAP
+            gc.collect()
+            torch.cuda.empty_cache()
         else:
             sync_frames_dev = sync_frames.to(device)
             model_dict_with_device = {**model_dict, 'device': device}
-            sync_feat = encode_video_with_sync(sync_frames_dev, AttributeDict(model_dict_with_device))
+            # batch_size=-1: process all segments at once (original behaviour;
+            # fine when enough VRAM is available without cpu_offload)
+            sync_feat = encode_video_with_sync(sync_frames_dev, AttributeDict(model_dict_with_device), batch_size=-1)
 
         # --- Text Feature Extraction ---
         prompts = [negative_prompt, prompt]
@@ -775,7 +823,11 @@ class HunyuanFoleySampler(io.ComfyNode):
                 clap_dict = {**model_dict, 'device': device,
                              'clap_model': model_dict['clap_model']}
                 text_feat_res, _ = encode_text_feat(prompts, AttributeDict(clap_dict))
+                del clap_dict
             text_feat_res = text_feat_res.cpu()
+            # Release CLAP VRAM before denoising
+            gc.collect()
+            torch.cuda.empty_cache()
         else:
             model_dict_with_device = {**model_dict, 'device': device}
             text_feat_res, _ = encode_text_feat(prompts, AttributeDict(model_dict_with_device))
